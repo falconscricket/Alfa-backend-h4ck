@@ -6,16 +6,21 @@
  * and any device can then ask for a signal without needing its own local
  * history - the server already has it.
  *
- * Persistence: snapshotted to disk periodically so a simple restart
- * doesn't lose everything. For durability across REDEPLOYS on Railway,
- * attach a Volume mounted at DATA_DIR (see README) - without one, the
- * disk is ephemeral and resets on redeploy, though it survives ordinary
- * restarts/sleeps in between.
+ * Persistence:
+ *   - If MONGODB_URI is set (same variable license-store.js already
+ *     uses), the candle store snapshot is saved to a single MongoDB
+ *     document and reloaded from there on startup. This survives
+ *     Render's free-tier ephemeral filesystem (spin-down after 15 min
+ *     idle wipes local disk, but MongoDB Atlas is a separate service).
+ *   - If MONGODB_URI is NOT set, falls back to the original local JSON
+ *     file behavior (fine for Railway with a Volume, or plain local
+ *     testing) - nothing changes for setups that don't use Mongo.
  * -----------------------------------------------------------------------
  */
 
 const fs = require("fs");
 const path = require("path");
+const { MongoClient } = require("mongodb");
 
 const TIMEFRAME_SECONDS = { "1m": 60, "3m": 180, "5m": 300, "30m": 1800, "1h": 3600, "4h": 14400 };
 const MAX_CANDLES_PER_TF = 300;
@@ -26,6 +31,10 @@ const STORE_FILE = path.join(DATA_DIR, "candles.json");
 // store[symbol][tf] = { current: {time,open,high,low,close}|null, history: [...] }
 let store = {};
 
+let mode = "local-json"; // or "mongodb"
+let mongoClient = null;
+let collection = null;
+
 function ensureDataDir() {
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -34,7 +43,30 @@ function ensureDataDir() {
   }
 }
 
-function load() {
+async function initStore() {
+  if (process.env.MONGODB_URI) {
+    try {
+      mongoClient = new MongoClient(process.env.MONGODB_URI);
+      await mongoClient.connect();
+      const db = mongoClient.db(process.env.MONGODB_DB || "alfa_strategy");
+      collection = db.collection("tickstore");
+      mode = "mongodb";
+
+      const doc = await collection.findOne({ _id: "snapshot" });
+      if (doc && doc.data) {
+        store = doc.data;
+        console.log("Tick store loaded from MongoDB Atlas");
+      } else {
+        console.log("Tick store starting fresh in MongoDB Atlas");
+      }
+      return;
+    } catch (e) {
+      console.warn("MongoDB unavailable for tick store, falling back to local JSON:", e.message);
+      mode = "local-json";
+    }
+  }
+
+  // Local JSON fallback
   ensureDataDir();
   try {
     if (fs.existsSync(STORE_FILE)) {
@@ -42,12 +74,26 @@ function load() {
       console.log(`Tick store loaded from ${STORE_FILE}`);
     }
   } catch (e) {
-    console.warn("Could not load tick store, starting fresh:", e.message);
+    console.warn("Could not load local tick store, starting fresh:", e.message);
     store = {};
   }
 }
 
-function save() {
+async function save() {
+  if (mode === "mongodb" && collection) {
+    try {
+      await collection.updateOne(
+        { _id: "snapshot" },
+        { $set: { data: store, updatedAt: new Date() } },
+        { upsert: true }
+      );
+      return;
+    } catch (e) {
+      console.warn("Could not save tick store to MongoDB:", e.message);
+      return;
+    }
+  }
+
   ensureDataDir();
   try {
     fs.writeFileSync(STORE_FILE, JSON.stringify(store));
@@ -95,8 +141,19 @@ function getCandleCount(symbol, tf) {
   return store[symbol]?.[tf]?.history.length || 0;
 }
 
-load();
-setInterval(save, 15000);
-process.on("SIGTERM", () => { save(); process.exit(0); });
+function getMode() {
+  return mode;
+}
 
-module.exports = { ingestTick, getCandles, getCandleCount, TIMEFRAME_SECONDS };
+// initStore() is async (Mongo connect), but ingestTick() etc. are called
+// synchronously all over server.js right away. That's fine - ingestTick
+// just writes to the in-memory `store` object either way; the only thing
+// that depends on initStore() finishing is which backend save()/load()
+// use, and the periodic save() calls below only start after init.
+initStore().then(() => {
+  setInterval(save, 15000);
+});
+
+process.on("SIGTERM", async () => { await save(); process.exit(0); });
+
+module.exports = { ingestTick, getCandles, getCandleCount, getMode, TIMEFRAME_SECONDS };

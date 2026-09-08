@@ -142,7 +142,7 @@ app.post('/api/calculate-signal', async (req, res) => {
 });
 
 app.get('/health', async (_req, res) => {
-  res.json({ ok: true, service: 'alfa-strategy-backend', serverTime: Date.now(), licenseMode: REQUIRE_LICENSE ? 'required' : 'optional' });
+  res.json({ ok: true, service: 'alfa-strategy-backend', serverTime: Date.now(), licenseMode: REQUIRE_LICENSE ? 'required' : 'optional', tickStoreMode: tickStore.getMode() });
 });
 
 (async () => {
